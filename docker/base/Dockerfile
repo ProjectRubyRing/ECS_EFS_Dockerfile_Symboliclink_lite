@@ -21,7 +21,9 @@ USER root
 # シンボリックリンク切れの原因を追いやすくする。
 RUN mkdir -p /mnt/logs /mnt/data /webapp /opt/jboss-eap
 
-# EFS 上のディレクトリ整備・タスク ID リンク張り替えを行うエントリポイント
+# EFS 上のディレクトリ整備・「起動時刻-ランダム8桁」リンク張り替えを行う
+# エントリポイント。タスク ID を使う旧実装は entrypoint.taskid.sh に保管して
+# あり、そちらへ戻したい場合は COPY 対象を差し替える。
 COPY entrypoint.sh /usr/local/bin/efs-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/efs-entrypoint.sh \
     # Windows でチェックアウトされた場合の CRLF 混入対策
