@@ -170,6 +170,11 @@ docker build -t interapi-back:latest \
 2. **EFS のパーミッション**: コンテナの実行ユーザー (例: jboss, uid=185) が
    `/mnt/logs` `/mnt/data` に書けるよう、EFS アクセスポイント
    (ownerUid/ownerGid/permissions) の利用を推奨。
+   また `efs-entrypoint.sh` は冒頭で **`umask 002`** を設定する。既定の
+   umask 022 では作成するディレクトリが `0755` (group に write 権限なし) となり、
+   EFS アクセスポイントで同一 gid・別 uid の後続タスクが `mid/<タスクID>`
+   ディレクトリを作成/更新できず失敗しうる。`umask 002` により `0775`
+   (group write 可) で作成させ、タスク ID ディレクトリの作成失敗を防ぐ。
 3. **古いタスク ID ディレクトリの削除**: `mid/` 配下は起動のたびに増える。
    ライフサイクル管理 (EFS の IA/アーカイブ、または定期削除バッチ) を用意すること。
 4. **dangling リンクは正常**: ビルド直後のイメージ内ではリンク先が存在しないため
