@@ -10,6 +10,8 @@
 # 作成するシンボリックリンク:
 #   /webapp/webapp9mb02/logs      -> /mnt/logs/<Component_name>/logs/<Service_Name>
 #   /opt/jboss-eap/standalone/log -> /mnt/logs/<Component_name>/logs/<Service_Name>/mid/current
+#     (`current` は EFS 上のリンクで、エントリポイントが起動ごとに
+#      「起動時刻-ランダム8桁」の実体ディレクトリへ張り替える 2 段リンク構成)
 #
 # ビルド例:
 #   docker build -t intra-api-back:latest \
@@ -44,7 +46,9 @@ RUN rm -rf /webapp/webapp9mb02/logs \
     && ln -s "/mnt/logs/${Component_name}/logs/${Service_Name}" /webapp/webapp9mb02/logs
 
 # --- 2. ミドルウェア(JBoss EAP)ログ ------------------------------------------
-# フロントと同様、実体ディレクトリを削除して EFS 上の 2 段リンク入口へ向ける
+# フロントと同様、実体ディレクトリを削除して EFS 上の 2 段リンク入口へ向ける。
+# `current` の実体 (.../mid/<起動時刻-ランダム8桁>) はエントリポイントが起動時に
+# EFS 上へ作成・張り替える。
 RUN rm -rf /opt/jboss-eap/standalone/log \
     && ln -s "/mnt/logs/${Component_name}/logs/${Service_Name}/mid/current" /opt/jboss-eap/standalone/log
 

@@ -12,7 +12,7 @@
 #   /webapp/webapp9mf02/pdf       -> /mnt/data/pdf          ※ intra-web のみ
 #   /opt/jboss-eap/standalone/log -> /mnt/logs/<Component_name>/logs/<Service_Name>/mid/current
 #     (`current` は EFS 上のリンクで、エントリポイントが起動ごとに
-#      ECS タスク ID = 実体ディレクトリへ張り替える 2 段リンク構成)
+#      「起動時刻-ランダム8桁」の実体ディレクトリへ張り替える 2 段リンク構成)
 #
 # ビルド例 (サービス × コンポーネントごとにイメージを作成する):
 #   docker build -t intra-web-front:latest \
@@ -68,7 +68,7 @@ RUN if [ "${Service_Name}" = "intra-web" ] || [ "${Service_Name}" = "intraweb" ]
 # --- 3. ミドルウェア(JBoss EAP)ログ ------------------------------------------
 # ビルド時に実体の log ディレクトリを削除し、EFS 上の 2 段リンク入口
 # (`.../mid/current`) へ向けたリンクに置き換える。
-# タスクごとの実体 (.../mid/<タスクID>) への張り替えはエントリポイントが
+# 起動ごとの実体 (.../mid/<起動時刻-ランダム8桁>) への張り替えはエントリポイントが
 # EFS 上 (書き込み可) で行うため、readonlyRootFilesystem=true でも動作する。
 RUN rm -rf /opt/jboss-eap/standalone/log \
     && ln -s "/mnt/logs/${Component_name}/logs/${Service_Name}/mid/current" /opt/jboss-eap/standalone/log
