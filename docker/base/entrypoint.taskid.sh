@@ -8,6 +8,16 @@
 # 参照用として残している。タスク ID 方式へ戻したい場合は base の Dockerfile の
 # COPY 対象をこのファイルに差し替えればよい。
 #   COPY entrypoint.taskid.sh /usr/local/bin/efs-entrypoint.sh
+#
+# ★★ 切り替え時の必須作業 ★★
+#   本ファイルには entrypoint.sh に後から追加した以下が入っていない。
+#     - 「1. configuration の復元 (configuration-seed → configuration)」ブロック
+#     - die / dump_diag / is_writable による fail-fast と事前検証
+#   これらが無いまま ECS (readonlyRootFilesystem=true + configuration に
+#   書き込み可能ボリューム) で動かすと、configuration が空のまま JBoss が起動し、
+#   logging.properties 不在により **server.log にも標準出力にも一切ログが出ない**
+#   まま失敗する。切り替える場合は entrypoint.sh の当該ブロックを必ず移植すること。
+#   背景と対処は docs/TROUBLESHOOTING.md を参照。
 # -----------------------------------------------------------------------------
 # efs-entrypoint.sh (旧)
 #
