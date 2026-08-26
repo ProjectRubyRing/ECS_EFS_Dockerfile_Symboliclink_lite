@@ -10,6 +10,8 @@
 導入した構成を前提に、原因の切り分けと恒久対応をまとめる。
 設計の全体像は [`DESIGN.md`](./DESIGN.md)、採用しなかった案は
 [`REJECTED_ALTERNATIVES.md`](./REJECTED_ALTERNATIVES.md) を参照。
+`cp -a` が非 0 終了する条件だけを掘り下げたものは
+[`CP_PRESERVE_OWNERSHIP.md`](./CP_PRESERVE_OWNERSHIP.md)。
 
 ---
 
@@ -85,7 +87,7 @@ ECS でだけ失敗する典型パターン。
 | 書き方 | 何が起きるか |
 |---|---|
 | `cp -a seed/. configuration/` が **EROFS** | `configuration` にボリュームを当て忘れている（readonlyRootFilesystem 下）。`set -eu` なら entrypoint が即死、`\|\| true` を付けていると空のまま起動して無音 |
-| `cp -a` が **chown 失敗で非 0 終了** | EFS アクセスポイントは uid/gid を強制するため `-a`(＝`-p`) の所有権保持が必ず失敗する。**ファイルはコピーされているのに終了コードは 1** → `set -e` で entrypoint 死。→ **`-a` / `-p` を使わず `cp -R` にする** |
+| `cp -a` が **chown 失敗で非 0 終了** | `-a`(＝`-p`) の所有権保持が `chown` の EPERM で失敗する。**ファイルはコピーされているのに終了コードは 1** → `set -e` で entrypoint 死。**EFS アクセスポイント固有ではなく、非 root 実行 (`USER jboss`) ならタスクローカルボリューム上でも必ず起きる**。→ **`-a` / `-p` を使わず `cp -R` にする**。条件の全体像は [`CP_PRESERVE_OWNERSHIP.md`](./CP_PRESERVE_OWNERSHIP.md) |
 | `cp -r seed/* configuration/` | **ドットファイルを拾わない**。→ **`cp -R seed/. configuration/`（末尾 `/.`）にする** |
 | `cp -a seed configuration/` | `configuration/configuration-seed/` が出来るだけで中身は空 |
 | コピー先が **EACCES** | EFS AP の ownerUid/ownerGid と実行 uid の不一致、`elasticfilesystem:ClientWrite` 欠落、EFS ファイルシステムポリシーの root squash |
@@ -261,6 +263,13 @@ RUN set -eu; \
     cp -R "${SEED_DIR}/." "${CONF_DIR}/" \
         || die "seed の書き戻しに失敗しました (${SEED_DIR} -> ${CONF_DIR})"
 ```
+
+> **`-a` を避ける理由は EFS アクセスポイント固有ではない。**
+> `-a`(＝`-p`) は `chown(2)` を呼ぶため、**非 root 実行 (`USER jboss`) なら
+> コピー先がタスクローカルボリュームであっても必ず EPERM になる**。
+> EFS 直マウントでも `ClientRootAccess` が無ければ root ごと squash されて同じ結果。
+> 条件の全体像と EFS 抜きの最小再現は
+> [`CP_PRESERVE_OWNERSHIP.md`](./CP_PRESERVE_OWNERSHIP.md) を参照。
 
 書き戻しの前後で以下を検証し、満たさなければ理由を出して `exit 1` する。
 
