@@ -88,11 +88,52 @@ ECS でだけ失敗する典型パターン。
 |---|---|
 | `cp -a seed/. configuration/` が **EROFS** | `configuration` にボリュームを当て忘れている（readonlyRootFilesystem 下）。`set -eu` なら entrypoint が即死、`\|\| true` を付けていると空のまま起動して無音 |
 | `cp -a` が **chown 失敗で非 0 終了** | `-a`(＝`-p`) の所有権保持が `chown` の EPERM で失敗する。**ファイルはコピーされているのに終了コードは 1** → `set -e` で entrypoint 死。**EFS アクセスポイント固有ではなく、非 root 実行 (`USER jboss`) ならタスクローカルボリューム上でも必ず起きる**。→ **`-a` / `-p` を使わず `cp -R` にする**。条件の全体像は [`CP_PRESERVE_OWNERSHIP.md`](./CP_PRESERVE_OWNERSHIP.md) |
+| `cp` が **`cannot create regular file ... Permission denied`** | コピー**先**の既存エントリを上書きできない。ディレクトリは書けるのにファイルだけ落ちる場合は、**前回タスクが別 uid・group write 無しで作った残存ファイル**が原因。`cp -Rf` (open に失敗したら unlink して作り直す) で解消する。サブディレクトリごと書けない場合はボリュームの永続化をやめるか中身を作り直す。→ [3-A-1](#3-a-1-cannot-create-regular-file--permission-denied-の切り分け) |
 | `cp -r seed/* configuration/` | **ドットファイルを拾わない**。→ **`cp -R seed/. configuration/`（末尾 `/.`）にする** |
 | `cp -a seed configuration/` | `configuration/configuration-seed/` が出来るだけで中身は空 |
 | コピー先が **EACCES** | EFS AP の ownerUid/ownerGid と実行 uid の不一致、`elasticfilesystem:ClientWrite` 欠落、EFS ファイルシステムポリシーの root squash |
 
 **結果はどれも同じ: `logging.properties` が無い → 完全無音。**
+
+#### 3-A-1. `cannot create regular file ... Permission denied` の切り分け
+
+```
+cp: cannot create regular file '/opt/jboss-eap/standalone/configuration/./standalone.xml': Permission denied
+[efs-entrypoint] FATAL: seed の書き戻しに失敗しました
+```
+
+`failed to preserve ownership`（`cp -a` の chown 失敗。→
+[`CP_PRESERVE_OWNERSHIP.md`](./CP_PRESERVE_OWNERSHIP.md)）とは**別物**である。
+こちらは `open(O_WRONLY|O_CREAT|O_TRUNC)` 自体が `EACCES` で、
+**コピーは 1 バイトも行われていない**。
+
+`open` が `EACCES` になる条件は 2 つしかない。
+
+| # | 条件 | 見分け方 | 対処 |
+|:-:|------|----------|------|
+| 1 | **既存ファイル**に write 権限が無い（別 uid 所有・`0644` など） | エラーに出るパスが `ls -l` で自分以外の所有 / `-rw-r--r--` | **`cp -Rf`**。ディレクトリに write 権限があれば unlink して作り直せる |
+| 2 | **親ディレクトリ**に write 権限が無い | `ls -ld <親>` が自分以外の所有かつ group write 無し / `touch <親>/.w` も失敗 | AP の uid/gid・`ClientWrite` を直す。永続ボリュームなら中身を作り直す |
+
+entrypoint は `#1` を自動で解消し（`cp -Rf` + コピー後の `chmod -R g+rwX`）、
+`#2` なら書けないパスを列挙して落ちる。
+
+```
+[efs-entrypoint] 考えられる原因: ...
+---------- configuration permissions ----------
+# id
+# ls -ld /opt/jboss-eap/standalone/configuration
+# /opt/jboss-eap/standalone/configuration 配下で書き込めない既存エントリ (先頭 20 件)
+```
+
+**なぜ `is_writable` を通ったのに落ちるのか**: `is_writable` は
+`configuration` 直下に新規ファイルを 1 つ作れるかしか見ていない。
+`#1`（既存ファイルの上書き）も `#2`（サブディレクトリ）もこの検査は素通りする。
+
+**恒久対策**: `configuration` にはタスクローカルの**エフェメラル**ボリュームを
+当てる（毎起動で空 → 残存ファイルが原理的に発生しない）。
+EFS など永続ストレージを当てている場合は、uid が変わるたびに同じ問題が起きる。
+
+---
 
 ### 🔴 B. configuration 以外の書き込み先が read-only のまま
 
@@ -255,13 +296,22 @@ RUN set -eu; \
 ### 5-2. 起動時 — `docker/base/entrypoint.sh`
 
 ```sh
+    prepare_conf_tree      # seed 側のディレクトリ構造を先に作り、既存には g+rwX を試みる
+
     # cp のオプションに注意:
     #   -a / -p は所有権を保持しようとするが、EFS アクセスポイントは
     #   uid/gid を強制するため chown が必ず失敗し、「ファイルはコピー
     #   できているのに終了コードが非 0」になる。set -e と組み合わさると
     #   ここで無音死する典型パターンなので使わない。
-    cp -R "${SEED_DIR}/." "${CONF_DIR}/" \
-        || die "seed の書き戻しに失敗しました (${SEED_DIR} -> ${CONF_DIR})"
+    #   -f は既存の書き込み不可ファイルを unlink して作り直す。
+    #   「cannot create regular file ... Permission denied」の対策 (3 章 A-1)。
+    if ! cp -Rf "${SEED_DIR}/." "${CONF_DIR}/"; then
+        dump_conf_perm     # 書けないパスを列挙してから落とす
+        die "seed の書き戻しに失敗しました (${SEED_DIR} -> ${CONF_DIR})"
+    fi
+
+    # 次回起動 (同一 gid・別 uid) が上書きできるように付け直す (best-effort)
+    chmod -R g+rwX "${CONF_DIR}" 2>/dev/null || true
 ```
 
 > **`-a` を避ける理由は EFS アクセスポイント固有ではない。**
@@ -277,6 +327,7 @@ RUN set -eu; \
 |---|---|
 | `SEED_DIR` の存在・非空 | base のビルドで seed 作成に失敗している |
 | `CONF_DIR` への**実書き込み** | ボリューム未マウント (EROFS) / uid gid 不一致 (EACCES) |
+| `CONF_DIR` 配下の**既存エントリの上書き可否** | 残存ファイルは `cp -Rf` が unlink して解消。ディレクトリ側が書けない場合は該当パスを列挙して `exit 1` (3 章 A-1) |
 | `CONF_DIR/logging.properties` | **無いと JBoss が完全に無音で死ぬ** |
 | `CONF_DIR/${JBOSS_CONFIG_FILE}` | 設定ファイル名の不一致 |
 | `standalone/log` の `readlink -f` | 2 段リンクが dangling |
