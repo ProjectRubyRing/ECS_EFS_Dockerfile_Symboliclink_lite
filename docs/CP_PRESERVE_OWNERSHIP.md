@@ -122,11 +122,11 @@ cp -R exit=0
 
 ---
 
-## 5. 対応方針 — 現状の実装のままで正しい
+## 5. 対応方針 — 所有権保持については現状の実装で正しい
 
 | 箇所 | 現状 | 判定 |
 |------|------|------|
-| 起動時 `docker/base/entrypoint.sh` | `cp -R "${SEED_DIR}/." "${CONF_DIR}/"` | **変更不要**。所有権を保持しないので上表のどのケースでも成功する |
+| 起動時 `docker/base/entrypoint.sh` | `cp -Rf "${SEED_DIR}/." "${CONF_DIR}/"` | 所有権を保持しないので上表のどのケースでも chown 失敗は起きない。`-f` は別問題 (既存ファイルの上書き不可) への対策 → 5-1 |
 | ビルド時 `docker/base/Dockerfile` | `cp -a "${JBOSS_CONF_DIR}/." "${JBOSS_CONF_SEED_DIR}/"` | **変更不要**。root かつ overlayfs 同一 FS なので chown は no-op で通る (#5) |
 
 補足:
@@ -141,6 +141,50 @@ cp -R exit=0
   これらの失敗は終了コードを変えない仕様。EFS (NFSv4.1) がこれらの属性に
   対応していなくても非 0 終了の直接原因にはならない。
   **犯人は常に ownership** だと考えてよい
+
+---
+
+## 5-1. 紛らわしい別のエラー — `cannot create regular file ... Permission denied`
+
+本書が扱うのは `cp -a` の**所有権保持の失敗**であり、次のメッセージは**別問題**である。
+
+```
+cp: failed to preserve ownership for '...': Operation not permitted   ← 本書の対象。コピーは成功、終了コードだけ 1
+cp: cannot create regular file '...': Permission denied               ← 別問題。open(2) が EACCES でコピーされていない
+```
+
+後者は `-a` を外しても直らない。原因はコピー**先**の書き込み権限で、次の 2 つだけ。
+
+| 何が書けないか | 対処 |
+|---|---|
+| **既存ファイル** (別 uid 所有・group write 無し) が残っている | `cp -Rf`。ディレクトリに write 権限があれば unlink して作り直せる |
+| **親ディレクトリ**が書けない (EROFS / EACCES) | `-f` では通らない。ボリュームのマウントと AP の uid/gid を直す |
+
+`docker/base/entrypoint.sh` は起動時のコピーを `cp -Rf` で行い、
+コピー後に `chmod -R g+rwX` して次タスクへ持ち越さないようにしている。
+詳細は [`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md) 3 章 A-1 /
+[`DESIGN.md`](./DESIGN.md) 7 章「起動時に `-f` を付ける理由」。
+
+最小再現 (4 章と同じくローカル FS のみ):
+
+```sh
+docker run --rm debian:12 sh -uc '
+mkdir -p /seed /dst
+echo new > /seed/a
+chmod -R a+rX /seed
+echo old > /dst/a && chmod 644 /dst/a && chmod 777 /dst
+su -s /bin/sh nobody -c "
+  cp -R  /seed/. /dst/; echo \"cp -R  exit=\$?\"
+  cp -Rf /seed/. /dst/; echo \"cp -Rf exit=\$?\"
+"
+'
+```
+
+```
+cp: cannot create regular file '/dst/./a': Permission denied
+cp -R  exit=1
+cp -Rf exit=0
+```
 
 ---
 

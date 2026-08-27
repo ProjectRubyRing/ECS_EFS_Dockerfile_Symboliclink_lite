@@ -310,7 +310,7 @@ FILE ハンドラも構成されず、`server.log` は作られず標準出力�
 | | コマンド | 理由 |
 |---|---|---|
 | ビルド時 | `cp -a "${SRC}/." "${DST}/"` | root かつ同一 FS なので所有権・時刻を保持してよい |
-| 起動時 | `cp -R "${SEED_DIR}/." "${CONF_DIR}/"` | **`-a` / `-p` は使わない**。所有権保持のための `chown` が失敗し、「ファイルはコピーできているのに終了コードが非 0」になる。`set -e` と組み合わさると無音死する |
+| 起動時 | `cp -Rf "${SEED_DIR}/." "${CONF_DIR}/"` | **`-a` / `-p` は使わない**。所有権保持のための `chown` が失敗し、「ファイルはコピーできているのに終了コードが非 0」になる。`set -e` と組み合わさると無音死する。**`-f` は付ける** — 別 uid が残した既存ファイルを open できず `cannot create regular file ... Permission denied` になるのを防ぐ (下記) |
 
 いずれも**末尾 `/.` が必須**。`${SRC}/*` はドットファイルを取りこぼし、
 `${SRC}` は `dst/configuration-seed/` を作ってしまう。
@@ -332,6 +332,28 @@ EFS ですらないため、実際に効くのは 1 行目の「非 root 実行�
 したがって「AP を使っていないから `cp -a` に戻してよい」は成り立たない。
 詳細と EFS 抜きの最小再現は
 [`CP_PRESERVE_OWNERSHIP.md`](./CP_PRESERVE_OWNERSHIP.md) を参照。
+
+#### 起動時に `-f` を付ける理由 — 所有権保持とは別の失敗
+
+`cp -a` の `failed to preserve ownership` は「コピーは済んだのに終了コードだけ 1」だが、
+`cannot create regular file ... Permission denied` は `open(2)` が `EACCES` で
+**コピー自体が行われていない**。原因は次の 2 つだけ。
+
+| 何が書けないか | 起きる状況 | 対処 |
+|---|---|---|
+| **既存ファイル** | 前回タスクが**別 uid**・group write 無しで作ったものが残っている (`configuration` を永続化している場合) | `-f` が unlink して作り直す。親ディレクトリの write 権限だけで足りる |
+| **親ディレクトリ** | AP の uid/gid 不一致、`ClientWrite` 欠落、ボリューム未マウント (EROFS) | `-f` では通らない。書けないパスを列挙して `exit 1` する |
+
+あわせて起動時に次の 2 つを行い、同じ問題が次回起動に持ち越されないようにしている。
+
+- `prepare_conf_tree`: seed 側のディレクトリ構造を先に作り、既存ディレクトリには
+  `g+rwX` を試みる (所有者でなければ失敗するので best-effort)
+- コピー後の `chmod -R g+rwX "${CONF_DIR}"`: 同一 gid・別 uid の次タスクが
+  `-f` 無しでも上書きできる状態にする
+
+`configuration` に**エフェメラル**なタスクローカルボリュームを当てていれば
+毎起動で空になるため既存ファイル問題は原理的に発生しない。これが推奨構成である。
+切り分け手順は [`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md) 3 章 A-1。
 
 ### 切り替え用の環境変数
 

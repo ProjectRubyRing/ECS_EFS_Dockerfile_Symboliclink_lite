@@ -178,6 +178,42 @@ SEED_DIR="${JBOSS_CONF_SEED_DIR:-${STANDALONE_DIR}/configuration-seed}"
 CONFIG_SEED_MODE="${CONFIG_SEED_MODE:-overwrite}"
 JBOSS_CONFIG_FILE="${JBOSS_CONFIG_FILE:-standalone.xml}"
 
+# 上書きの邪魔になる既存エントリを、コピー前に通れる状態にしておく。
+#   - seed 側のディレクトリ構造を先に作る
+#     (中間ディレクトリが「別 uid 所有・group write なし」で残っていると
+#      その配下のファイル作成が EACCES になる)
+#   - 既存ディレクトリには g+rwX を付け直す。chmod は所有者しか成功しない
+#     ため best-effort だが、自タスクが作った残骸はこれで通るようになる。
+prepare_conf_tree() {
+    ( cd "${SEED_DIR}" && find . -type d -print 2>/dev/null ) \
+    | while IFS= read -r _rel; do
+        _dst="${CONF_DIR}/${_rel#./}"
+        [ -d "${_dst}" ] || mkdir -p "${_dst}" 2>/dev/null || true
+        [ -w "${_dst}" ] || chmod g+rwX "${_dst}" 2>/dev/null || true
+    done
+}
+
+# cp が EACCES で落ちたときに「どのパスが誰の所有で書けないのか」を出す。
+# これが無いと cp の 1 行 (cannot create regular file ...) だけが残り、
+# 「ディレクトリが書けない」のか「既存ファイルが書けない」のか判別できない。
+dump_conf_perm() {
+    {
+        echo "---------- configuration permissions ----------"
+        echo "# id"
+        id 2>/dev/null || true
+        echo "# ls -ld ${CONF_DIR}"
+        ls -ld "${CONF_DIR}" 2>/dev/null || true
+        echo "# ${CONF_DIR} 配下で書き込めない既存エントリ (先頭 20 件)"
+        find "${CONF_DIR}" -maxdepth 3 \( -type f -o -type d \) -print 2>/dev/null \
+        | while IFS= read -r _p; do
+            [ -w "${_p}" ] || ls -ld "${_p}" 2>/dev/null || true
+        done | head -20
+        echo "# ls -ld ${SEED_DIR}"
+        ls -ld "${SEED_DIR}" 2>/dev/null || true
+        echo "-----------------------------------------------"
+    } >&2
+}
+
 restore_configuration() {
     [ -d "${SEED_DIR}" ] \
         || die "seed ディレクトリ ${SEED_DIR} がありません。base イメージのビルドで configuration-seed の作成に失敗しています。"
@@ -208,6 +244,8 @@ restore_configuration() {
         return 0
     fi
 
+    prepare_conf_tree
+
     # cp のオプションに注意:
     #   -a / -p は所有権とタイムスタンプを保持しようとするが、EFS アクセス
     #   ポイントは uid/gid を強制するため chown が必ず失敗し、
@@ -215,12 +253,35 @@ restore_configuration() {
     #   set -e と組み合わさるとここで無音死する典型パターンなので使わない。
     #   -R (保持なし) なら新規ファイルは実行 uid の所有になり、
     #   パーミッションビットは seed 側 (ビルド時に g+rwX 済み) が引き継がれる。
+    #   -f は「既存の書き込み不可ファイルを open できなかったら unlink して
+    #   作り直す」オプション。ディレクトリ側に write 権限があれば通るため、
+    #     cp: cannot create regular file '.../standalone.xml': Permission denied
+    #   の典型原因である「前回タスクが別 uid・group write 無し (umask 022 時代の
+    #   イメージ等) で作った残存ファイルを上書きできない」を解消する。
+    #   ※ 上書きできない本当の理由がディレクトリ側 (EROFS / EACCES) の場合は
+    #     -f でも通らないので、そのまま die して原因を出す。
     #   なお `cp -R "${SEED_DIR}/." "${CONF_DIR}/"` の末尾 `/.` が重要で、
     #   `seed/*` ではドットファイルを取りこぼし、`seed` では
     #   configuration/configuration-seed/ が出来てしまう。
-    # 本処理は上書きであり、seed に存在しない残存ファイルの削除は行わない。
-    cp -R "${SEED_DIR}/." "${CONF_DIR}/" \
-        || die "seed の書き戻しに失敗しました (${SEED_DIR} -> ${CONF_DIR})"
+    # 本処理は上書きであり、seed に存在しない残存ファイルの削除は行わない
+    # (-f が unlink するのは「これから上書きする対象」だけ)。
+    if ! cp -Rf "${SEED_DIR}/." "${CONF_DIR}/"; then
+        echo "[efs-entrypoint] 考えられる原因:" >&2
+        echo "[efs-entrypoint]   (a) ${CONF_DIR} 配下のサブディレクトリが別 uid 所有で" >&2
+        echo "[efs-entrypoint]       group write 不可のまま残っている (ボリュームを永続化" >&2
+        echo "[efs-entrypoint]       している場合に起きる)。中身を消して作り直すか、" >&2
+        echo "[efs-entrypoint]       毎起動で空になるボリュームを使う。" >&2
+        echo "[efs-entrypoint]   (b) EFS/アクセスポイントの uid/gid と実行ユーザーの不一致、" >&2
+        echo "[efs-entrypoint]       または elasticfilesystem:ClientWrite の欠落 (EACCES)。" >&2
+        echo "[efs-entrypoint]   (c) ${CONF_DIR} がボリューム未マウントで read-only (EROFS)。" >&2
+        dump_conf_perm
+        die "seed の書き戻しに失敗しました (${SEED_DIR} -> ${CONF_DIR})"
+    fi
+
+    # 次回起動 (同一 gid・別 uid のタスク) が上書きできるよう group write を
+    # 付け直す。所有者でないファイルには失敗するが、それは今回書き込めた
+    # ファイル群には該当しないため best-effort でよい。
+    chmod -R g+rwX "${CONF_DIR}" 2>/dev/null || true
 
     say "configuration を復元しました (mode=${CONFIG_SEED_MODE}, $(ls -A1 "${CONF_DIR}" 2>/dev/null | wc -l) エントリ)"
 }
