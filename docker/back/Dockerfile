@@ -9,9 +9,10 @@
 #
 # 作成するシンボリックリンク:
 #   /webapp/webapp9mb02/logs      -> /mnt/logs/<Component_name>/logs/<Service_Name>
-#   /opt/jboss-eap/standalone/log -> /mnt/logs/<Component_name>/logs/<Service_Name>/mid/current
-#     (`current` は EFS 上のリンクで、エントリポイントが起動ごとに
-#      「起動時刻-ランダム8桁」の実体ディレクトリへ張り替える 2 段リンク構成)
+#   /opt/jboss-eap/standalone/log -> tmp/jboss-log-target
+#     相対リンク。実体は起動時に、タスクローカルな standalone/tmp 上の
+#     jboss-log-target から EFS の実ディレクトリへ張る。
+#     共有の mid/current は案内札であり、server.log を開く経路ではない。
 #
 # ビルド例:
 #   docker build -t intra-api-back:latest \
@@ -46,11 +47,12 @@ RUN rm -rf /webapp/webapp9mb02/logs \
     && ln -s "/mnt/logs/${Component_name}/logs/${Service_Name}" /webapp/webapp9mb02/logs
 
 # --- 2. ミドルウェア(JBoss EAP)ログ ------------------------------------------
-# フロントと同様、実体ディレクトリを削除して EFS 上の 2 段リンク入口へ向ける。
-# `current` の実体 (.../mid/<起動時刻-ランダム8桁>) はエントリポイントが起動時に
-# EFS 上へ作成・張り替える。
+# フロントと同様、実体ディレクトリを削除してタスクローカルな
+# tmp/jboss-log-target への相対リンクに置き換える。
+# 共有の mid/current は開く経路にしない (日付ローテーションの rename が
+# 他タスクの server.log を前日付ファイルへ付け替えるのを防ぐ)。
 RUN rm -rf /opt/jboss-eap/standalone/log \
-    && ln -s "/mnt/logs/${Component_name}/logs/${Service_Name}/mid/current" /opt/jboss-eap/standalone/log
+    && ln -s tmp/jboss-log-target /opt/jboss-eap/standalone/log
 
 # リンクの張り先を確認できるようビルドログへ出力 (ビルド時検証)
 RUN ls -l /webapp/webapp9mb02/ /opt/jboss-eap/standalone/ | grep -E ' logs| log' || true

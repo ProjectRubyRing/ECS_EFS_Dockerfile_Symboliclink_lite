@@ -30,15 +30,17 @@ ENV JBOSS_HOME=${JBOSS_HOME} \
 # シンボリックリンク切れの原因を追いやすくする。
 RUN mkdir -p /mnt/logs /mnt/data /webapp "${JBOSS_HOME}"
 
-# EFS 上のディレクトリ整備・「起動時刻-ランダム8桁」リンク張り替え・
-# configuration の seed 書き戻しを行うエントリポイント。タスク ID を使う旧実装は
-# entrypoint.taskid.sh に保管してあり、そちらへ戻したい場合は COPY 対象を
-# 差し替える (ただし旧実装には configuration 復元処理が入っていないため、
-# entrypoint.sh の「1. configuration の復元」ブロックの移植が必須)。
+# EFS 上のディレクトリ整備、ログ実ディレクトリの固定、configuration の
+# seed 書き戻しを行うエントリポイント。
+# ディレクトリ名の既定は「起動時刻-ランダム8桁」。ECS タスク ID にするときは
+# LOG_ID_MODE=taskid を渡すか、ENTRYPOINT を efs-entrypoint-taskid.sh にする。
+# 後者はラッパーであり、実装は efs-entrypoint.sh と共有する。
+# ラッパーを efs-entrypoint.sh の名前で上書きしてはいけない。
 COPY entrypoint.sh /usr/local/bin/efs-entrypoint.sh
-RUN chmod 0755 /usr/local/bin/efs-entrypoint.sh \
+COPY entrypoint.taskid.sh /usr/local/bin/efs-entrypoint-taskid.sh
+RUN chmod 0755 /usr/local/bin/efs-entrypoint.sh /usr/local/bin/efs-entrypoint-taskid.sh \
     # Windows でチェックアウトされた場合の CRLF 混入対策
-    && sed -i 's/\r$//' /usr/local/bin/efs-entrypoint.sh
+    && sed -i 's/\r$//' /usr/local/bin/efs-entrypoint.sh /usr/local/bin/efs-entrypoint-taskid.sh
 
 # ここに JBoss EAP 本体の導入やミドルウェア共通設定など、
 # front / back 共通のレイヤーを追加する。

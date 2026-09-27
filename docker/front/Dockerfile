@@ -10,9 +10,10 @@
 # 作成するシンボリックリンク:
 #   /webapp/webapp9mf02/logs      -> /mnt/logs/<Component_name>/logs/<Service_Name>
 #   /webapp/webapp9mf02/pdf       -> /mnt/data/pdf          ※ intra-web のみ
-#   /opt/jboss-eap/standalone/log -> /mnt/logs/<Component_name>/logs/<Service_Name>/mid/current
-#     (`current` は EFS 上のリンクで、エントリポイントが起動ごとに
-#      「起動時刻-ランダム8桁」の実体ディレクトリへ張り替える 2 段リンク構成)
+#   /opt/jboss-eap/standalone/log -> tmp/jboss-log-target
+#     相対リンク。実体は起動時に、タスクローカルな standalone/tmp 上の
+#     jboss-log-target から EFS の実ディレクトリへ張る。
+#     共有の mid/current は案内札であり、server.log を開く経路ではない。
 #
 # ビルド例 (サービス × コンポーネントごとにイメージを作成する):
 #   docker build -t intra-web-front:latest \
@@ -66,12 +67,16 @@ RUN if [ "${Service_Name}" = "intra-web" ] || [ "${Service_Name}" = "intraweb" ]
     fi
 
 # --- 3. ミドルウェア(JBoss EAP)ログ ------------------------------------------
-# ビルド時に実体の log ディレクトリを削除し、EFS 上の 2 段リンク入口
-# (`.../mid/current`) へ向けたリンクに置き換える。
-# 起動ごとの実体 (.../mid/<起動時刻-ランダム8桁>) への張り替えはエントリポイントが
-# EFS 上 (書き込み可) で行うため、readonlyRootFilesystem=true でも動作する。
+# ビルド時に実体の log ディレクトリを削除し、タスクローカルな tmp 上の
+# リンク (起動時にエントリポイントが実ディレクトリへ張る) へ向ける。
+# 共有 EFS の mid/current をここへ向けると、ローリングデプロイで current が
+# 張り替わったあと、先発 JVM の日付ローテーションが後発の server.log を
+# 前日付の名前へ rename する。tmp はタスクごとに分かれているので、
+# この相対リンクの解決先は他タスクから変わらない。
+# readonlyRootFilesystem=true でも、リンク自体はビルド時に作り、
+# リンクの中身 (tmp/jboss-log-target) は書き込み可能ボリューム上に作る。
 RUN rm -rf /opt/jboss-eap/standalone/log \
-    && ln -s "/mnt/logs/${Component_name}/logs/${Service_Name}/mid/current" /opt/jboss-eap/standalone/log
+    && ln -s tmp/jboss-log-target /opt/jboss-eap/standalone/log
 
 # リンクの張り先を確認できるようビルドログへ出力 (ビルド時検証)
 RUN ls -l /webapp/webapp9mf02/ /opt/jboss-eap/standalone/ | grep -E ' logs| log| pdf' || true

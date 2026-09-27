@@ -16,12 +16,18 @@
 #      ため、この復元をしないと JBoss の設定一式が丸ごと消える。
 #   2. EFS 上にアプリログ用ディレクトリを作成する
 #      (イメージビルド時に焼き込んだシンボリックリンクの「実体側」を用意する)
-#   3. コンテナ起動時に「起動時刻 + ランダム英数字 8 桁」で一意なディレクトリ名
-#      を生成し、/mnt/logs/<Component_name>/logs/<Service_Name>/mid/<一意名> を
-#      作成、EFS 上の `current` シンボリックリンクをそのディレクトリへ張り替える。
+#   3. コンテナ起動時に一意なディレクトリ名を生成し、
+#      /mnt/logs/<Component_name>/logs/<Service_Name>/mid/<一意名> を作成する。
+#      名前の既定は「起動時刻 + ランダム英数字 8 桁」(LOG_ID_MODE=timestamp)。
+#      LOG_ID_MODE=taskid のときは ECS タスク ID を使う (取得失敗時は timestamp
+#      へフォールバックする)。
+#      JBoss が開くパスはこの実ディレクトリに固定する。EFS 上の `current` は
+#      「最後に起動したタスク」を示す案内札だけで、server.log の open にも
+#      日付ローテーションの rename にも使わせない。
 #      ルート FS 側の /opt/jboss-eap/standalone/log はビルド時に
-#      `.../mid/current` へ向けて作成済みのため、2 段リンク経由で
-#      起動のたびに一意なディレクトリへ書き込まれる。
+#      standalone/tmp/jboss-log-target (タスクローカル) へ向け、起動時にその
+#      リンクを実ディレクトリへ張る。tmp はタスクごとに別ボリュームなので、
+#      他タスクが current を張り替えてもこのコンテナの解決先は変わらない。
 #   4. JBoss が起動時に書き込む standalone 配下の可変ディレクトリを
 #      「実際に書き込んでみて」検証する。
 #   5. サービスが intra-web かつフロントコンテナの場合のみ、
@@ -46,9 +52,10 @@
 #   秒精度のタイムスタンプと組み合わせることで衝突確率を実質ゼロにする。
 #   /dev/urandom が無い環境向けに uuid / awk 乱数へ多段フォールバックする。
 #   さらに生成直後に mkdir で実在チェックし、万一衝突しても引き直す。
-#   ※ タスク ID を使う旧実装は entrypoint.taskid.sh に保管している。
-#      そちらには本ファイルの「1. configuration の復元」が入っていないため、
-#      切り替える際は当該ブロックを必ず移植すること。
+#   ※ ECS タスク ID をディレクトリ名にする場合は、本ファイルを LOG_ID_MODE=taskid
+#      で起動する。entrypoint.taskid.sh はそのためのラッパーである。
+#      旧ラッパーには configuration 復元も日付ローテーション対策も無かったため、
+#      単体スクリプトとしては廃止した。実装は本ファイルに一本化している。
 #
 # 必要な環境変数(すべてイメージビルド時に ENV で焼き込み済み):
 #   EFS_LOG_DIR    : /mnt/logs/<Component_name>/logs/<Service_Name>
@@ -62,6 +69,14 @@
 #                       missing   = 設定ファイルが無いときだけ復元する
 #                       skip      = 復元しない (configuration を永続化する運用)
 #   JBOSS_CONFIG_FILE : 起動に使う設定ファイル名 (既定 standalone.xml)
+#   LOG_ID_MODE       : timestamp (既定) | taskid
+#                       timestamp = 起動時刻-ランダム8桁 (メタデータ非依存)
+#                       taskid    = ECS タスク ID。同一タスクのコンテナ再起動は
+#                                   同じディレクトリを再利用する
+#   LOG_LINK_STRICT   : 0 (既定) | 1
+#                       1 のとき、standalone/log が共有 current をまだ指していれば
+#                       起動を中止する。0 では警告し、JBOSS_LOG_DIR で実ディレクトリ
+#                       へ固定したまま起動する (旧イメージの段階移行用)
 # =============================================================================
 set -eu
 
@@ -156,6 +171,112 @@ gen_rand8() {
                 for(i=0;i<8;i++){ s=s substr(c,int(rand()*36)+1,1) } print s }')"
     fi
     printf '%s' "${_r}"
+}
+
+# ECS メタデータ v4 の TaskARN 末尾 (タスク ID) を返す。
+# 取得できない、またはディレクトリ名に使えない文字が含まれるときは空文字。
+# 呼び出し失敗でエントリポイント自体は落とさない (taskid モードのフォールバック用)。
+fetch_ecs_task_id() {
+    _id=""
+    if [ -n "${ECS_CONTAINER_METADATA_URI_V4:-}" ]; then
+        _meta="$(curl -fsS --max-time 5 "${ECS_CONTAINER_METADATA_URI_V4}/task" 2>/dev/null \
+             || wget -q -T 5 -O - "${ECS_CONTAINER_METADATA_URI_V4}/task" 2>/dev/null \
+             || true)"
+        _arn="$(printf '%s' "${_meta}" | sed -n 's/.*"TaskARN"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+        _id="${_arn##*/}"
+    fi
+    case "${_id}" in
+        ""|*[!A-Za-z0-9_-]*)
+            printf '%s' ""
+            ;;
+        *)
+            printf '%s' "${_id}"
+            ;;
+    esac
+}
+
+# 起動時刻-ランダム8桁。mkdir が成功した名前だけを採用する (同時起動の衝突回避)。
+# 結果はグローバル LOG_ID に入れる (say と標準出力を混ぜないため)。
+allocate_timestamp_log_id() {
+    LOG_ID=""
+    _i=0
+    while [ "${_i}" -lt 5 ]; do
+        _cand="$(date +%Y%m%d%H%M%S)-$(gen_rand8)"
+        if mkdir "${MID_DIR}/${_cand}" 2>/dev/null; then
+            LOG_ID="${_cand}"
+            return 0
+        fi
+        _i=$((_i + 1))
+    done
+    LOG_ID="$(date +%Y%m%d%H%M%S)-$(gen_rand8)-$$"
+    mkdir -p "${MID_DIR}/${LOG_ID}" \
+        || die "${MID_DIR}/${LOG_ID} を作成できません。EFS の書き込み権限を確認してください。"
+}
+
+# ECS タスク ID。同一タスク内でコンテナだけ再起動されたときはディレクトリを再利用する。
+# 再利用したディレクトリに前日の server.log が残っていれば、JBoss は最初のログ出力で
+# そのファイルを server.log.yyyy-MM-dd へ rename してから新しい server.log を開く。
+# これはそのタスクのディレクトリの中だけで完結する正規のローテーションである。
+allocate_task_log_id() {
+    LOG_ID="$(fetch_ecs_task_id)"
+    if [ -z "${LOG_ID}" ]; then
+        echo "[efs-entrypoint] WARN: ECS タスク ID を取得できないため起動時刻-ランダム8桁にフォールバックします" >&2
+        allocate_timestamp_log_id
+        return 0
+    fi
+    if mkdir "${MID_DIR}/${LOG_ID}" 2>/dev/null; then
+        return 0
+    fi
+    if [ -d "${MID_DIR}/${LOG_ID}" ]; then
+        say "ECS task id のログディレクトリを再利用します: ${LOG_ID} (同一タスク内のコンテナ再起動)"
+        return 0
+    fi
+    die "${MID_DIR}/${LOG_ID} を作成できません。EFS の書き込み権限を確認してください。"
+}
+
+# JBoss の open / rename が辿るパスを、このコンテナの実ディレクトリに固定する。
+#
+# 共有の mid/current を開いたままにすると、後から起動したタスクが current を
+# 張り替えたあと、先に起動していた JVM の日付ローテーションが
+# 「いま current が指している側」の server.log を rename する。
+# rename されても、新しいタスクがすでに持っているファイルディスクリプタは
+# 古い inode を指したままなので、日付が変わったあとも server.log.yyyy-MM-dd
+# へ書き続けてしまう。
+#
+# JAVA_OPTS へ -Djboss.server.log.dir を足さないこと。standalone.conf は
+# JAVA_OPTS が空でないと既定のヒープ設定をスキップするため。
+# ディレクトリの指定は JBOSS_LOG_DIR 環境変数だけで行う (standalone.sh が
+# -Djboss.server.log.dir と -Dorg.jboss.boot.log.file の両方に展開する)。
+pin_jboss_log_directory() {
+    CONCRETE_LOG_DIR="${MID_DIR}/${LOG_ID}"
+    export JBOSS_LOG_DIR="${CONCRETE_LOG_DIR}"
+
+    _priv="${STANDALONE_DIR}/tmp/jboss-log-target"
+    _needs_priv=0
+    if [ -L "${STANDALONE_DIR}/log" ]; then
+        _direct="$(readlink "${STANDALONE_DIR}/log" 2>/dev/null || true)"
+        case "${_direct}" in
+            tmp/jboss-log-target|*/jboss-log-target)
+                _needs_priv=1
+                ;;
+        esac
+    fi
+
+    if [ -d "${STANDALONE_DIR}/tmp" ] && is_writable "${STANDALONE_DIR}/tmp"; then
+        ln -sfn "${CONCRETE_LOG_DIR}" "${_priv}" \
+            || die "コンテナ専用ログリンクを作成できません (${_priv})"
+    elif [ "${_needs_priv}" -eq 1 ]; then
+        echo "[efs-entrypoint] ${STANDALONE_DIR}/log は tmp/jboss-log-target を指していますが、" >&2
+        echo "[efs-entrypoint] ${STANDALONE_DIR}/tmp に書き込めません。" >&2
+        echo "[efs-entrypoint] タスク定義で containerPath=${STANDALONE_DIR}/tmp の" >&2
+        echo "[efs-entrypoint] 書き込み可能ボリュームが必要です。" >&2
+        die "${STANDALONE_DIR}/tmp にコンテナ専用ログリンクを作れません。"
+    else
+        echo "[efs-entrypoint] WARN: ${STANDALONE_DIR}/tmp に書けないためコンテナ専用リンクは作れません。" >&2
+        echo "[efs-entrypoint] WARN: standalone.sh は JBOSS_LOG_DIR=${JBOSS_LOG_DIR} を使って実ディレクトリへ書きます。" >&2
+    fi
+    say "JBoss EAP log dir (concrete): ${CONCRETE_LOG_DIR}"
+    say "JBOSS_LOG_DIR=${JBOSS_LOG_DIR}"
 }
 
 # =============================================================================
@@ -323,33 +444,27 @@ mkdir -p "${EFS_LOG_DIR}" \
 MID_DIR="${EFS_LOG_DIR}/mid"
 mkdir -p "${MID_DIR}" || die "${MID_DIR} を作成できません。"
 
-# 「起動時刻(秒) + ランダム 8 桁」で起動のたびに一意な名前を作る。
-# 万一同一秒・同一乱数で既存ディレクトリと衝突した場合に備え、
-# 衝突しない名前になるまで数回だけ引き直す (mkdir は原子的なので、
-# 複数タスクが同時に同名を狙っても片方だけが成功する)。
-LOG_ID=""
-_i=0
-while [ "${_i}" -lt 5 ]; do
-    _cand="$(date +%Y%m%d%H%M%S)-$(gen_rand8)"
-    if mkdir "${MID_DIR}/${_cand}" 2>/dev/null; then
-        LOG_ID="${_cand}"
-        break
-    fi
-    _i=$((_i + 1))
-done
-if [ -z "${LOG_ID}" ]; then
-    # ここへ来ることはまず無いが、保険として PID を足して確実に作る
-    LOG_ID="$(date +%Y%m%d%H%M%S)-$(gen_rand8)-$$"
-    mkdir -p "${MID_DIR}/${LOG_ID}" \
-        || die "${MID_DIR}/${LOG_ID} を作成できません。EFS の書き込み権限を確認してください。"
-fi
+# ディレクトリ名。既定は起動時刻-ランダム8桁。タスク ID 方式は LOG_ID_MODE=taskid。
+LOG_ID_MODE="${LOG_ID_MODE:-timestamp}"
+case "${LOG_ID_MODE}" in
+    timestamp)
+        allocate_timestamp_log_id
+        ;;
+    taskid)
+        allocate_task_log_id
+        ;;
+    *)
+        die "LOG_ID_MODE の値が不正です: '${LOG_ID_MODE}' (timestamp|taskid)"
+        ;;
+esac
 
-# EFS 上の current リンクを今回起動のディレクトリへ張り替える。
+# EFS 上の current は運用者が「最後に起動した実ディレクトリ」を辿る案内札。
+# JBoss の open / rename はこのリンクを通さない (pin_jboss_log_directory)。
 # 相対リンクにしておくことで EFS をどこにマウントしても壊れない。
 # (-n: current が既存リンクでもリンク先ディレクトリの中に作らない)
 ln -sfn "${LOG_ID}" "${MID_DIR}/current" \
     || die "current リンクを張り替えられません (${MID_DIR}/current)。既存 current の所有者と ${MID_DIR} の group write 権限を確認してください。"
-say "JBoss EAP log dir: ${MID_DIR}/${LOG_ID}"
+pin_jboss_log_directory
 
 # =============================================================================
 # 4. JBoss が書き込む standalone 配下ディレクトリの検証
@@ -359,11 +474,40 @@ say "JBoss EAP log dir: ${MID_DIR}/${LOG_ID}"
 # tmp / data が書けなければ JBoss はロギング構成より前段で落ち、
 # やはり無音のまま終了する。実書き込みで検証して先に潰す。
 
-# log は 2 段リンクの解決先が実在し、かつ書けることまで確認する
+# log の解決先が実在し、かつ書けることまで確認する。
+# 新しいイメージでは standalone/log -> tmp/jboss-log-target -> 実ディレクトリ。
+# 旧イメージでは standalone/log -> .../mid/current のままなので、ここでは警告し、
+# JBOSS_LOG_DIR (実ディレクトリ) で standalone.sh の書き込み先を固定する。
 LOG_LINK="${STANDALONE_DIR}/log"
+if [ -L "${LOG_LINK}" ]; then
+    _direct="$(readlink "${LOG_LINK}" 2>/dev/null || true)"
+    case "${_direct}" in
+        tmp/jboss-log-target|*/jboss-log-target)
+            _resolved="$(readlink -f "${LOG_LINK}" 2>/dev/null || true)"
+            _expect="$(readlink -f "${CONCRETE_LOG_DIR}" 2>/dev/null || true)"
+            if [ -z "${_resolved}" ] || [ "${_resolved}" != "${_expect}" ]; then
+                die "${LOG_LINK} が ${CONCRETE_LOG_DIR} に解決されません (resolved='${_resolved}')。tmp/jboss-log-target の作成に失敗しています。"
+            fi
+            ;;
+        *"/mid/current"|*/current|current)
+            echo "[efs-entrypoint] WARN: ${LOG_LINK} が共有の current を指しています (${_direct})。" >&2
+            echo "[efs-entrypoint] WARN: この経路のまま日付をまたぐと、先発タスクのローテーションが" >&2
+            echo "[efs-entrypoint] WARN: 後発タスクの server.log を server.log.yyyy-MM-dd へ rename し、" >&2
+            echo "[efs-entrypoint] WARN: 後発タスクは前日付ファイルへ書き続けます。" >&2
+            echo "[efs-entrypoint] WARN: front/back イメージを再ビルドし、リンク先を tmp/jboss-log-target にしてください。" >&2
+            echo "[efs-entrypoint] WARN: 再ビルドまでは standalone.sh が JBOSS_LOG_DIR=${JBOSS_LOG_DIR} を使うことで同じ事故を避けます。" >&2
+            if [ "${LOG_LINK_STRICT:-0}" = "1" ]; then
+                die "${LOG_LINK} が共有 current を指しています (LOG_LINK_STRICT=1)。"
+            fi
+            ;;
+        *)
+            echo "[efs-entrypoint] WARN: ${LOG_LINK} のリンク先が想定外です: ${_direct}" >&2
+            ;;
+    esac
+fi
 LOG_REAL="$(readlink -f "${LOG_LINK}" 2>/dev/null || true)"
 if [ -z "${LOG_REAL}" ] || [ ! -d "${LOG_REAL}" ]; then
-    die "${LOG_LINK} の解決に失敗しました (dangling symlink)。ビルド時のリンク先と EFS_LOG_DIR='${EFS_LOG_DIR}' が一致しているか確認してください。"
+    die "${LOG_LINK} の解決に失敗しました (dangling symlink)。ビルド時のリンク先 (tmp/jboss-log-target) と、起動時に tmp へ作るリンクを確認してください。EFS_LOG_DIR='${EFS_LOG_DIR}'"
 fi
 is_writable "${LOG_REAL}" \
     || die "${LOG_LINK} -> ${LOG_REAL} に書き込めません。server.log を作成できないため JBoss は無音になります。EFS アクセスポイントの uid/gid を確認してください。"
@@ -404,7 +548,7 @@ if [ "${COMPONENT_ROLE:-}" = "front" ]; then
     esac
 fi
 
-say "preflight OK. starting: $*"
+say "preflight OK (log-id-mode=${LOG_ID_MODE}, concrete=${CONCRETE_LOG_DIR}). starting: $*"
 
 # 本来の起動コマンド (CMD) へ制御を渡す
 exec "$@"

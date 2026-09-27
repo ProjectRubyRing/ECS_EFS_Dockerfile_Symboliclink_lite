@@ -19,16 +19,18 @@
   フロントコンテナ
     /webapp/webapp9mf02/logs ──────────────► /mnt/logs/<Component_name>/logs/<Service_Name>
     /webapp/webapp9mf02/pdf  ──────────────► /mnt/data/pdf          ※ intra-web のみ作成
-    /opt/jboss-eap/standalone/log ─────────► /mnt/logs/<Component_name>/logs/<Service_Name>/mid/current
+    /opt/jboss-eap/standalone/log ─────────► standalone/tmp/jboss-log-target
+                                              └──► /mnt/logs/.../mid/<今回の一意名>   ※ current は経由しない
 
   バックコンテナ
     /webapp/webapp9mb02/logs ──────────────► /mnt/logs/<Component_name>/logs/<Service_Name>
-    /opt/jboss-eap/standalone/log ─────────► /mnt/logs/<Component_name>/logs/<Service_Name>/mid/current
+    /opt/jboss-eap/standalone/log ─────────► standalone/tmp/jboss-log-target
+                                              └──► /mnt/logs/.../mid/<今回の一意名>
 
 【タスクローカルの書き込み可能ボリューム = 起動のたびに空でマウントされる】
 
   /opt/jboss-eap/standalone/configuration ◄── 起動時に configuration-seed から書き戻す
-  /opt/jboss-eap/standalone/tmp           … JBoss の VFS 展開先
+  /opt/jboss-eap/standalone/tmp           … JBoss の VFS 展開先。加えて jboss-log-target リンク
   /opt/jboss-eap/standalone/data          … content リポジトリ
 
   /opt/jboss-eap/standalone/configuration-seed   … ルート FS (ビルド時に退避・読み取り専用)
@@ -37,17 +39,20 @@
 
     /mnt/logs/<Component_name>/logs/<Service_Name>/            … アプリログ実体
     /mnt/logs/<Component_name>/logs/<Service_Name>/mid/
-        ├── current ──► <起動時刻-ランダム8桁>  (起動ごとに ln -sfn で張り替え)
-        ├── <起動時刻-ランダム8桁-1>/       … 前々回起動の JBoss ログ (残存)
-        ├── <起動時刻-ランダム8桁-2>/       … 前回起動の JBoss ログ (残存)
-        └── <起動時刻-ランダム8桁-3>/       … 今回起動の JBoss ログ ◄─ current
+        ├── current ──► <直近の一意名>      … 案内札。JBoss はここを開かない
+        ├── <一意名-1>/                     … 前々回の JBoss ログ (残存)
+        ├── <一意名-2>/                     … 前回の JBoss ログ (残存)
+        └── <一意名-3>/                     … 今回の JBoss ログ
+                                              ▲
+                                              └── このコンテナの tmp/jboss-log-target
+                                                  と JBOSS_LOG_DIR が指す
     /mnt/data/pdf/                          … intra-web フロントの起動時に無ければ作成
 ```
 
 > ディレクトリ名は例:`20260722103045-x7sk1z0e`
 > (`起動時刻(YYYYMMDDhhmmss)` + `-` + `ランダム英数字8桁`)。
-> ECS タスク ID を使う旧方式は `docker/base/entrypoint.taskid.sh` に保管している
-> (下記 3 章および `REJECTED_ALTERNATIVES.md` 案 A' を参照)。
+> ECS タスク ID をディレクトリ名にするときは `LOG_ID_MODE=taskid`
+> (ラッパーは `docker/base/entrypoint.taskid.sh`)。下記 3 章を参照。
 
 ## 2. なぜこの構成なのか — readonlyRootFilesystem=true との両立
 
@@ -69,7 +74,10 @@
 
 この分担により、起動後のルート FS 書き込みはゼロになる。
 
-## 3. JBoss EAP ログの「起動ごとの一意性」— 2 段リンク方式 (採用案)
+## 3. JBoss EAP ログの「起動ごとの一意性」— 実ディレクトリ固定 (採用案)
+
+日付をまたぐローリングデプロイで `server.log.yyyy-MM-dd` へ書き続ける事故と、
+その対策の動作説明は [`SERVER_LOG_DATE_ROLLOVER.md`](./SERVER_LOG_DATE_ROLLOVER.md) を参照。
 
 ### 課題
 
@@ -80,21 +88,27 @@
 「全タスクで共通」になってしまう。一方、リンク自体はビルド時に作るしかない
 (2 章の制約)。
 
-### 解決: リンクを 2 段に分ける
+### 解決: ビルド時の入口と、起動時の実ディレクトリを分ける
 
 1. **ビルド時 (ルート FS 側)**:
-   `/opt/jboss-eap/standalone/log → /mnt/logs/<Component_name>/logs/<Service_Name>/mid/current`
-   という「固定の」リンクを作成する。一意名を含まないためビルド時に確定できる。
-2. **起動時 (EFS 側)**: エントリポイント `efs-entrypoint.sh` が
-   - コンテナ起動時に `起動時刻(YYYYMMDDhhmmss)-ランダム英数字8桁` の一意名を生成する
-   - `mid/<一意名>` ディレクトリを作成する (mkdir は原子的なので、同時起動でも衝突しない)
-   - EFS 上のリンク `mid/current` を `ln -sfn <一意名> mid/current` で張り替える
+   `/opt/jboss-eap/standalone/log → tmp/jboss-log-target`
+   という相対リンクを作る。一意名を含まないのでビルド時に確定でき、
+   向き先の実体はタスクローカルな `standalone/tmp` の中にある。
+2. **起動時**: エントリポイント `efs-entrypoint.sh` が
+   - 一意名を作る。既定は `起動時刻(YYYYMMDDhhmmss)-ランダム英数字8桁`。
+     `LOG_ID_MODE=taskid` のときは ECS タスク ID (取得失敗時は timestamp へ戻す)
+   - `mid/<一意名>` ディレクトリを作成する
+   - `standalone/tmp/jboss-log-target` をその実ディレクトリへ向ける
+   - `JBOSS_LOG_DIR` に同じ実ディレクトリを入れる。`standalone.sh` が
+     `-Djboss.server.log.dir` と `-Dorg.jboss.boot.log.file` に展開する
+   - EFS 上の `mid/current` も同じ一意名へ向ける。これは運用者が
+     「最後に起動したディレクトリ」を見る案内札であり、JBoss は開かない
 
-JBoss がログを書くときのパス解決は
-`/opt/jboss-eap/standalone/log` → `mid/current` → `mid/<今回の一意名>`
-と 2 段で辿られ、**コンテナが起動し直すたびに新しいディレクトリへ書き込まれる**。
-過去起動のディレクトリは EFS 上にそのまま残るため、
-前の起動のログとの一意性が維持される。
+JBoss がログを書くときのパスは、起動した瞬間の実ディレクトリ
+`/mnt/logs/.../mid/<今回の一意名>/server.log` で固定される。
+他のタスクが `current` を張り替えても、この JVM の open と
+日付ローテーションの rename は自分のディレクトリの中だけで行われる。
+過去のディレクトリは EFS 上にそのまま残る。
 
 ### 一意ディレクトリ名の生成方式 — 起動時刻 + ランダム英数字 8 桁
 
@@ -114,12 +128,14 @@ JBoss がログを書くときのパス解決は
 この方式では ECS メタデータエンドポイントを一切呼ばないため、ローカルの
 `docker run` でもクラウドの ECS でも同じ挙動になる (環境差が無い)。
 
-> **ECS タスク ID を使う旧実装について**
-> ディレクトリ名に本物の ECS タスク ID を使う従来実装は
-> `docker/base/entrypoint.taskid.sh` にそのまま保管している。
-> `aws ecs describe-tasks` や CloudWatch のタスク ID とログを突き合わせたい
-> 場合はこちらへ戻せる (base の Dockerfile の `COPY` 対象を差し替えるだけ)。
-> トレードオフは `REJECTED_ALTERNATIVES.md` 案 A / 案 A' を参照。
+> **ECS タスク ID をディレクトリ名にする場合**
+> `LOG_ID_MODE=taskid` をタスク定義に渡すか、ENTRYPOINT を
+> `/usr/local/bin/efs-entrypoint-taskid.sh` にする。実装は `entrypoint.sh` と
+> 共通で、configuration の復元とログパスの固定も行われる。
+> ラッパーを `efs-entrypoint.sh` という名前で上書きしてはいけない。
+> 同一タスクの中でコンテナだけ再起動したときは、同じタスク ID のディレクトリを
+> 再利用する。日付をまたいだ再起動では、そのディレクトリの中だけで
+> `server.log` が `server.log.yyyy-MM-dd` へローテーションされる。
 
 ## 4. Service_Name / Component_name の渡し方 (検討と採用)
 
@@ -223,16 +239,18 @@ docker build -t interapi-back:latest \
 
 ## 6. 運用上の注意点
 
-1. **同一サービスの並行タスク (desiredCount > 1) と `current` リンク**
-   同じサービス・同じコンポーネントのタスクが複数同時に走ると、後から起動した
-   タスクが `current` を自分の一意名へ張り替える。各タスクの実体ディレクトリ
-   (`mid/<起動時刻-ランダム8桁>`) は一意なので **混ざらないが**、`current` は
-   「最後に起動したタスク」を指すため、先行タスクがローテーションで新規作成する
-   ファイルは後発タスクのディレクトリ側へ入り得る (open 済みファイルハンドルは
-   影響なし)。この `current` 競合の性質はタスク ID 方式でも同じである。
-   desiredCount=1 (ローリング時の一時 2 タスクは許容) なら実害はほぼ無いが、
-   常時複数タスクで厳密な分離が必要なら `REJECTED_ALTERNATIVES.md` の
-   案 C (jboss.server.log.dir) か案 D (エフェメラルボリューム間接リンク) を検討すること。
+1. **並行タスクと `current` リンク**
+   `minimumHealthyPercent=100` / `maximumPercent=200` のローリングデプロイ、
+   日中・夕方のスケールアウト、desiredCount>1 のいずれでも、古いタスクと新しい
+   タスクは同時に生きる。`current` は最後に起動したタスクを指す案内札である。
+   JBoss の open と日付ローテーションは `JBOSS_LOG_DIR` と
+   `tmp/jboss-log-target` が指す実ディレクトリに閉じる。
+   修正前は `standalone/log → mid/current` だったため、先発タスクが日付境界で
+   rename するとき、後発タスクの `server.log` が `server.log.yyyy-MM-dd` に
+   付け替わり、後発タスクの FD がその前日付ファイルへ書き続けた。
+   デプロイの 100/200 を 0/100 に変えても、ドレインが日付境界をまたげば
+   同じ rename が起きる。パスの固定が本対策で、デプロイ比率は無停止のための
+   設定として残してよい。詳細は `SERVER_LOG_DATE_ROLLOVER.md`。
 2. **EFS のパーミッション**: コンテナの実行ユーザー (例: jboss, uid=185) が
    `/mnt/logs` `/mnt/data` に書けるよう、EFS アクセスポイント
    (ownerUid/ownerGid/permissions) の利用を推奨。

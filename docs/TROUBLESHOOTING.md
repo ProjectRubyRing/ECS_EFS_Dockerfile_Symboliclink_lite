@@ -61,7 +61,7 @@ JBoss EAP の起動時ロギングは次でブートストラップされる。
 
 `standalone.xml` から console-handler を外している場合、出力先は
 `server.log` のみ。その `server.log` が
-`/opt/jboss-eap/standalone/log`（＝EFS への 2 段リンク）に書けなければ、
+`/opt/jboss-eap/standalone/log`（`tmp/jboss-log-target` 経由で EFS の実ディレクトリ）に書けなければ、
 やはり全部消える。
 
 **結論**: 症状から **「configuration が空/不完全」または「log リンクの先に
@@ -75,7 +75,8 @@ JBoss EAP の起動時ロギングは次でブートストラップされる。
 |:---:|------|------------------|
 | 🔴 | **A. 書き戻し失敗で `configuration` が空/部分的** | `ls -la $JBOSS_HOME/standalone/configuration/` |
 | 🔴 | **B. `configuration` 以外の可変領域が read-only** | `touch $JBOSS_HOME/standalone/tmp/.w` |
-| 🟠 | **C. log の 2 段リンクが解決できない/書けない** | `readlink -f $JBOSS_HOME/standalone/log` |
+| 🟠 | **C. log リンクが解決できない/書けない** | `readlink -f $JBOSS_HOME/standalone/log` |
+| 🟠 | **C2. 日付をまたいだあと server.log.yyyy-MM-dd へ書き続ける** | `SERVER_LOG_DATE_ROLLOVER.md`。`JBOSS_LOG_DIR` が実ディレクトリか、`standalone/log` が `tmp/jboss-log-target` かを確認 |
 | 🟠 | **D. そもそもコンテナが起動していない** | `aws ecs describe-tasks` の `stoppedReason` |
 | 🟡 | **E. `configuration` を EFS 共有にして同時上書き** | マウント種別が EFS か確認 |
 | 🟡 | **F. stdout が awslogs に届いていない** | `standalone.conf` のリダイレクト有無 |
@@ -153,10 +154,13 @@ standalone/log/          ← 本構成では EFS へリンク済み
 `tmp/vfs` の失敗はロギング構成より前段なので、`logging.properties` 不在と
 重なると例外ごと握り潰されて無音になる。
 
-### 🟠 C. log の 2 段リンクが解決できていない / 書けない
+### 🟠 C. log リンクが解決できていない / 書けない
 
+- イメージの `standalone/log` は `tmp/jboss-log-target` を指す。entrypoint が
+  実ディレクトリへのリンクを作る前に死ぬと、ここが **dangling symlink** になる。
+  `standalone/tmp` に書けないときも同じ
 - entrypoint が A で死んでいれば `mid/<起動時刻-ランダム8桁>` も `current` も
-  作られず、`/opt/jboss-eap/standalone/log` は **dangling symlink** のまま
+  作られない
 - **書き戻し処理を entrypoint の先頭に置くと A の失敗が C を連鎖させる**
 - 単独でも起き得る: EFS AP の uid/gid で
   `ln -sfn ... "${MID_DIR}/current"` が `EACCES`
@@ -330,7 +334,7 @@ RUN set -eu; \
 | `CONF_DIR` 配下の**既存エントリの上書き可否** | 残存ファイルは `cp -Rf` が unlink して解消。ディレクトリ側が書けない場合は該当パスを列挙して `exit 1` (3 章 A-1) |
 | `CONF_DIR/logging.properties` | **無いと JBoss が完全に無音で死ぬ** |
 | `CONF_DIR/${JBOSS_CONFIG_FILE}` | 設定ファイル名の不一致 |
-| `standalone/log` の `readlink -f` | 2 段リンクが dangling |
+| `standalone/log` の `readlink -f` | `tmp/jboss-log-target` が未作成で dangling |
 | `standalone/log` 解決先への実書き込み | `server.log` が作れない＝無音 |
 | `standalone/tmp` `standalone/data` への実書き込み | 起動最初期で死ぬ (B) |
 | `standalone/deployments` `content` | 警告のみ |
